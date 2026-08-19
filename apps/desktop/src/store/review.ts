@@ -322,7 +322,7 @@ export function toggleReview(
   if (isPaneVisible(REVIEW_PANE_ID)) {
     closeReview()
   } else {
-    revealReview(scopeCwd, scopeTarget)
+    revealReview(scopeCwd, scopeTarget, scopeSurfaceId)
   }
 }
 

@@ -311,6 +311,32 @@ describe('view state', () => {
     }
   })
 
+  it('wide toggle forwards the exact origin surface through revealReview', () => {
+    const originalMatchMedia = window.matchMedia
+
+    // Wide layout: the collapse media query does NOT match, so toggleReview
+    // takes the tree-backed branch (no layout tree in jsdom → pane not
+    // visible → revealReview). The origin must survive that hand-off; a
+    // dropped third argument here disabled agent-ship on every wide open.
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn(() => ({ matches: false }))
+    })
+
+    try {
+      stubReview()
+
+      toggleReview('/tile-worktree', 'tile:project-b', 'surface-project-b')
+
+      expect($reviewOpen.get()).toBe(true)
+      expect($reviewScopeCwd.get()).toBe('/tile-worktree')
+      expect($reviewScopeTarget.get()).toBe('tile:project-b')
+      expect($reviewScopeSurfaceId.get()).toBe('surface-project-b')
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia })
+    }
+  })
+
   it('closeReview closes the pane, clears selection, and drops scope', () => {
     stubReview()
     $reviewOpen.set(true)
