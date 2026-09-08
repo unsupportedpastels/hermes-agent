@@ -28,6 +28,6 @@ profile = ClaudeOAuthDirectSDKProfile(
     process_args=(),
     process_command_env_vars=('CLAUDE_OAUTH_DIRECTSDK_COMMAND',),
     default_aux_model='sonnet',
-    fallback_models=('sonnet', 'opus', 'haiku'),
+    fallback_models=('sonnet', 'opus', 'haiku', 'claude-fable-5-1'),
 )
 register_provider(profile)

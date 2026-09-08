@@ -15,6 +15,26 @@ claude auth login
 hermes --provider claude-oauth-directsdk -m sonnet
 ```
 
+For a saved selection, run `hermes model`, choose **Claude OAuth DirectSDK**, then
+choose a model. The TUI `/model` dialog and Desktop model picker use the same
+provider inventory; select the **Claude OAuth DirectSDK** row, not **Anthropic**
+or an ACP provider. The catalog includes the CLI aliases `sonnet`, `opus`, and
+`haiku`, plus Claude Fable 5.1 (`claude-fable-5-1`). Model availability still
+depends on the official CLI and your account; catalog presence is not live
+entitlement verification.
+
+The executable must be discoverable for the provider's models to appear. Desktop's
+configured-only view keeps this provider once selected with `hermes model` (or
+the persistent configuration below); Hermes does not inspect the Claude CLI's
+credentials to infer a sign-in. For an explicit session-only switch, use:
+
+```text
+/model claude-fable-5-1 --provider claude-oauth-directsdk --session
+```
+
+The picker preserves `claude-oauth-directsdk` and its `process://` backend marker.
+It does not route these choices through Anthropic's API or the ACP adapter.
+
 Authentication belongs to the official CLI. The plugin never opens, copies, refreshes, or prints its credential files. No Hermes API key is required or sent by the plugin. The normal Hermes client path rejects inherited API-key, custom Anthropic endpoint, and cloud-backend overrides before spawning; the error names conflicting environment variables without printing their values. Remove those overrides from the launching environment when selecting OAuth. There is no silent HTTP/API-key fallback in this client.
 
 Subscription entitlement and extra-usage settings still belong to the account and native service. Disable extra usage in the account if you do not want overage billing. A native list-price cost estimate is not proof of a subscription charge.
@@ -68,6 +88,7 @@ Token usage retains native uncached/cache-read/cache-write/output components. Mo
 
 ```sh
 scripts/run_tests.sh tests/providers/test_claude_oauth_directsdk.py
+scripts/run_tests.sh tests/tui_gateway/test_directsdk_picker.py
 ```
 
 Two consolidated invariant tests cover signed replay and harmless normalization, semantic-edit rejection, final tool batches/usage, async use, lazy failure, invalid parameters, conflicting auth, and active/paused/unstarted stream cleanup. A separate real-native loopback qualification passed parallel tools, full long descriptions/schemas, signed ordering, host-only results, exact usage, incremental streaming and native exit checks. Its responses are synthetic protocol fixtures, not paid-model evidence.
