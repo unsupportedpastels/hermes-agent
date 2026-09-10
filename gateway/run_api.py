@@ -141,11 +141,13 @@ class GatewayRuntimeAPI:
                 or not ws.client or ws.client.host not in {'127.0.0.1', '::1'}):
             await ws.close(code=4403)
             return
+        operator = True
         try:
             grant = self.runner.session_ticket_store.redeem(
                 ticket, profile_id=self.runner.session_authority.profile_id,
                 purpose='interactive')
         except PermissionError:
+            operator = False
             try:
                 grant = self.runner.session_ticket_store.redeem(
                     ticket, profile_id=self.runner.session_authority.profile_id,
@@ -158,4 +160,4 @@ class GatewayRuntimeAPI:
                                           'profile_id': grant['profile_id'],
                                           'instance_id': grant['instance_id'],
                                           'capabilities': grant['capabilities'], 'native_bootstrap': True},
-                        subprotocol='hermes-gateway-v1')
+                        subprotocol='hermes-gateway-v1', operator=operator)
