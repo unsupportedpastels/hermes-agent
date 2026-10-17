@@ -46722,6 +46722,24 @@
       }
     },
     {
+      "name": "bot_relay.settle",
+      "summary": "",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/CanonicalBotDeliverParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CanonicalBotDeliverResult"
+        }
+      }
+    },
+    {
       "name": "clarify.respond",
       "summary": "Generation-fenced answer to a pending clarify prompt (empty answer = skipped).",
       "params": [
