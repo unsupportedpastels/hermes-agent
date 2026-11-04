@@ -45,13 +45,12 @@ _SESSION_FALLBACK_ALLOWED = frozenset({
 # ``process.kill`` stays: its handler is already session-scoped.
 _PROCESS_GLOBAL = frozenset({"process.stop", "delegation.pause", "reload.mcp", "reload.env", "agents.list"})
 # Sidecar verbs that act on one live session. On an authority socket that session is the
-# authority's and never in ``server._sessions``, so the handler answered ``4001 session not found``
-# or (``tools.list`` / ``toolsets.list``) the launch profile's data. Without a ``session_id`` the
-# tools verbs are host-wide and still fall back.
+# authority's and never in ``server._sessions``, so the handler answered ``4001 session not found``.
+# ``tools.list`` / ``toolsets.list`` are not here: they answer with or without a session and still
+# fall back. Without a ``session_id`` ``tools.configure`` is host-wide and still falls back.
 _SESSION_BOUND = frozenset({
     "clipboard.paste", "handoff.fail", "handoff.request", "handoff.state", "image.attach",
     "image.detach", "input.detect_drop", "pdf.attach", "terminal.resize", "tools.configure",
-    "tools.list", "toolsets.list",
 })
 # ``browser.manage`` is NOT here: connect/disconnect run in the requesting profile's scope (the
 # ticket's home, or the session's ``profile_home`` via ``_profile_scoped``) and the live endpoint, the
