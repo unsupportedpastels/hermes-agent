@@ -66,21 +66,37 @@ class _ConsentRefusal(str):
         return refusal
 
 
-def _stage_node_deps(manifest: dict, tree: Path, console) -> Optional[str]:
-    """The Node-sidecar y/n question and ``npm`` run for *tree* (a staged tree before publication).
-    An npm failure is a warning, never a refusal; its reason is returned (None otherwise)."""
-    if not (tree / "package.json").is_file():
-        return None
+def _ask_and_install_node_deps(manifest: dict, tree: Path, console) -> None:
+    """The Node-sidecar y/n question and ``npm`` run for *tree*; an npm failure only warns."""
     console.print(f"\n[bold]{manifest.get('name', 'this plugin')}[/bold] declares Node dependencies (package.json).")
-    if sys.stdin.isatty() and sys.stdout.isatty() and _ask_yes_no(
-            ("node", manifest.get("name")), "  Install them into the plugin's own node_modules now? [y/N]: ", console):
+    node_ok = sys.stdin.isatty() and sys.stdout.isatty() and _ask_yes_no(
+        ("node", manifest.get("name")), "  Install them into the plugin's own node_modules now? [y/N]: ", console)
+    if node_ok:
         from pm.workspace import install_node_sidecar
 
-        if reason := install_node_sidecar(tree, explicit=True):
-            console.print(f"[yellow]⚠[/yellow] Node deps: {reason}")
-        return reason
-    console.print("[dim]Skipped Node deps — run `hermes plugins install` again to retry.[/dim]\n")
-    return None
+        node_reason = install_node_sidecar(tree, explicit=True)
+        if node_reason:
+            console.print(f"[yellow]⚠[/yellow] Node deps: {node_reason}")
+    else:
+        console.print("[dim]Skipped Node deps — run `hermes plugins install` again to retry.[/dim]\n")
+
+
+def _node_question_comes_next(staged: Path, target: Path) -> bool:
+    """Whether publishing *staged* as *target* in a TTY ``--enable`` install would be followed directly
+    by the Node-sidecar question: a ``package.json``, a target that is not enabled, a valid plugin
+    layout, no ``*.example`` file to create, no unset ``requires_env`` and a readable Python declaration."""
+    from pm.plugin_declarations import read_python_declaration
+    from pm.workspace import enabled_plugin_dirs
+
+    try:
+        read_python_declaration(staged)
+    except Exception:  # health: allow BLE001 -- same catch as _install_plugin_python_deps, which then refuses before the Node question
+        return False
+    return ((staged / "package.json").is_file()
+            and target.resolve() not in enabled_plugin_dirs(installing=target)
+            and _pc()._looks_like_plugin_dir(staged)
+            and not any(not (staged / example.stem).exists() for example in staged.glob("*.example"))
+            and not _pc()._missing_env_specs(_pc()._read_manifest(staged)))
 
 
 def _install_plugin_python_deps(
@@ -99,7 +115,7 @@ def _install_plugin_python_deps(
     Never raises — the caller keeps the plugin installed-but-disabled.
     *assume_yes* is ``--yes-deps``: the user's own non-interactive answer
     to the Python question, so a headless install is not refused (#122134).
-    *node* False skips the Node question: the caller already settled it on the staged tree.
+    *node* False skips the Node question: the caller already asked it on the staged tree.
     """
     from pm.plugin_declarations import read_python_declaration
 
@@ -117,7 +133,7 @@ def _install_plugin_python_deps(
     # question, same try-then-enable posture. Failure never blocks the
     # python path below.
     if has_package_json:
-        _stage_node_deps(manifest, target, console)
+        _ask_and_install_node_deps(manifest, target, console)
 
     if not has_python:
         return True, None
@@ -405,7 +421,7 @@ def _install_plugin_core(
     before_swap=None,
     app_title: Optional[str] = None,
     inspected_sha: Optional[str] = None,
-    node_deps: bool = False,
+    before_publish=None,
 ) -> tuple[Path, dict, str]:
     """Clone a Git plugin and atomically record its source and exact revision.
 
@@ -425,8 +441,7 @@ def _install_plugin_core(
     and may raise :class:`PluginOperationError` to abort (re-pin consent). *accept_caution* decides a
     caution scan verdict on its own when *force* only means "replace the existing tree" (an update's
     re-clone); None lets *force* decide both, as ``install --force`` does. *inspected_sha*: see
-    :func:`_clone_at_reviewed_commit`. *node_deps* asks the Node-sidecar question and installs
-    those dependencies in the staged tree before publication (see :func:`publish_plugin`)."""
+    :func:`_clone_at_reviewed_commit`. *before_publish*: see :func:`publish_plugin`."""
     requested_revision = _pc()._normalize_exact_revision(ref) if ref is not None else None
     try:
         git_url, subdir = _pc()._resolve_git_url(identifier)
@@ -550,7 +565,7 @@ def _install_plugin_core(
                 f"copies are under {backup} (re-apply by hand).[/yellow]")
         try:
             publish_plugin(tmp_target, target, old_metadata, new_metadata, require_consent=True,
-                           assume_consent=assume_deps_consent, node_deps=node_deps)
+                           assume_consent=assume_deps_consent, before_publish=before_publish)
         except Exception as exc:
             raise _pc().PluginOperationError(f"Plugin '{plugin_name}' was not published: {exc}",
                                              failure_class=_publish_failure_class(exc)) from exc
@@ -661,19 +676,25 @@ def cmd_install(
     if not brief:
         console.print(f"[dim]Cloning {git_url}{f' (subdir: {_subdir})' if _subdir else ''}...[/dim]")
     _interactive_scan_decision = interactive_scan_decision(console, "Install")
+    # A TTY --enable install asks the Node question right after publication. When nothing else would
+    # come first, ask it (and run npm) on the staged tree instead: same question, same order.
+    node_asked: list[Path] = []
 
-    # Node deps install in the staged tree before publication, for the installs that used to be
-    # asked about them after it: not --no-deps, not --no-enable, and not a non-TTY run without --enable.
-    node_deps = not no_deps and (bool(enable) or (enable is None and _pc()._is_tty()))
+    def _node_before_publication(staged: Path, target: Path) -> None:
+        if _node_question_comes_next(staged, target):
+            _ask_and_install_node_deps(_pc()._read_manifest(staged), staged, console)
+            node_asked.append(target)
+    before_publish = _node_before_publication if enable and not no_deps and _pc()._is_tty() else None
 
     def _install() -> tuple:
         if entry is not None:
             return catalog.install_catalog_entry(
                 entry, force=force, ref=ref, allow_removed=allow_removed, scan_decision_cb=_interactive_scan_decision,
-                python_deps=not no_deps, assume_deps_consent=yes_deps, node_deps=node_deps)
+                python_deps=not no_deps, assume_deps_consent=yes_deps, before_publish=before_publish)
         return _pc()._install_plugin_core(
             identifier, force=force, ref=ref, scan_decision_cb=_interactive_scan_decision,
-            python_deps=not no_deps, allow_removed=allow_removed, assume_deps_consent=yes_deps, node_deps=node_deps)
+            python_deps=not no_deps, allow_removed=allow_removed, assume_deps_consent=yes_deps,
+            before_publish=before_publish)
 
     try:
         target, installed_manifest, installed_name = recorded_install(
@@ -706,7 +727,7 @@ def cmd_install(
     deps_ok, deps_reason = (True, None)
     if should_enable and not already_active:
         deps_ok, deps_reason = _install_plugin_python_deps(installed_manifest, target, console,
-                                                           assume_yes=yes_deps, node=False)
+                                                           assume_yes=yes_deps, node=not node_asked)
 
     _pc()._display_after_install(target, identifier, brief=brief)
 

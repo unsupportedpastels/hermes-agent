@@ -91,69 +91,105 @@ def test_node_sidecar_question_stays_independent(tmp_path, monkeypatch):
     assert not any('Python dependencies' in str(line) for line in lines)
 
 
-def _tty_install_recording_npm(root, monkeypatch, files: dict, npm_error=None):
-    """A committed local plugin made of *files*, a TTY that answers yes, and an ``npm`` stub that
-    writes a marker into the tree it runs in. Returns ``(uri, calls)``: ``(tree, live_tree_existed)``."""
+_TOKENS = (('<<', None), ('declares Node', 'declares'), ('Skipped Node', 'skipped'), ('Node deps: npm', 'warn'),
+           ('Replacement installed', 'replacement'), ('node-plugin enabled', 'enabled'), ('not enabled', 'not-enabled'),
+           ('Cannot enable', 'refused'))
+_NPM_OK, _NPM_FAILS = None, 'npm ci exited 1: boom'
+# Every install path for a plugin shipping package.json; main runs npm in the live tree after publication.
+# The one path that runs it in the staged tree is a TTY --enable fresh install with nothing else to ask first.
+_MATRIX = {
+    'fresh tty yes': ('fresh', True, {}, 'env? enable? declares node? npm:live warn enabled'),
+    'fresh tty node no': ('fresh', True, {}, 'env? enable? declares node? skipped enabled'),
+    'fresh tty decline enable': ('fresh', True, {}, 'env? enable? not-enabled'),
+    'fresh non-tty': ('fresh', False, {}, 'env? not-enabled'),
+    'fresh non-tty --enable': ('fresh', False, {'enable': True}, 'env? declares skipped enabled'),
+    'fresh tty --enable': ('fresh-env-set', True, {'enable': True}, 'declares node? npm:staged warn enabled'),
+    'fresh tty --enable --yes-deps': ('fresh-env-set', True, {'enable': True, 'yes_deps': True},
+                                      'declares node? npm:staged warn enabled'),
+    'fresh tty --enable env prompt': ('fresh', True, {'enable': True}, 'env? declares node? npm:live warn enabled'),
+    'fresh --no-deps': ('fresh', True, {'no_deps': True}, 'env? not-enabled'),
+    'fresh --no-enable': ('fresh', True, {'enable': False}, 'env? not-enabled'),
+    'fresh --yes-deps': ('fresh', True, {'yes_deps': True}, 'env? enable? declares node? npm:live warn enabled'),
+    'active tty': ('active', True, {}, 'declares node? npm:staged warn replacement'),
+    'active --yes-deps': ('active', True, {'yes_deps': True}, 'replacement'),
+    'active --yes-deps --enable': ('active', True, {'yes_deps': True, 'enable': True}, 'replacement'),
+    'active --no-enable': ('active', True, {'enable': False}, 'declares node? npm:staged warn replacement'),
+}
+
+
+@pytest.mark.parametrize('npm_error', [_NPM_OK, _NPM_FAILS], ids=['npm-ok', 'npm-fails'])
+@pytest.mark.parametrize('case', list(_MATRIX))
+def test_install_paths_match_main_for_a_node_plugin(admission_env, monkeypatch, capsys, case, npm_error):  # health: allow F811 -- pytest injects the imported admission_env fixture by parameter name
+    """The prompts, npm runs, warnings and final state of every CLI install path. An npm failure only
+    warns (fail open); the Node question is never moved ahead of the env, Enable or consent prompts."""
+    import re
+
+    from hermes_cli import plugins_cmd_install
     from pm import workspace
 
+    setup, tty, flags, expected = _MATRIX[case]
+    root, home = admission_env
     source = root / 'plugin-source'
     source.mkdir()
-    for name, text in files.items():
-        (source / name).write_text(text, encoding='utf-8')
+    (source / 'plugin.yaml').write_text(yaml.safe_dump({'name': 'node-plugin', 'requires_env': ['NODE_PLUGIN_TOKEN']}), encoding='utf-8')
+    (source / '__init__.py').write_text('def register(ctx):\n    pass\n', encoding='utf-8')
+    (source / 'package.json').write_text(json.dumps({'name': 'node-plugin', 'version': '1.0.0'}), encoding='utf-8')
+    env = {k: v for k, v in os.environ.items() if k not in {'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'}}
+    for args in [('init', '-q'), ('add', '.'), ('-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture')]:
+        subprocess.run(['git', *args], cwd=source, env=env, check=True, capture_output=True, timeout=30)
+    monkeypatch.setenv('NODE_PLUGIN_TOKEN', 'set')
+    if setup == 'fresh':
+        monkeypatch.delenv('NODE_PLUGIN_TOKEN')
+    installed = home / 'plugins' / 'node-plugin'
+    monkeypatch.setattr(workspace, 'install_node_sidecar', lambda path, **_: (
+        print(f"<<npm:{'live' if path == installed else 'staged'}>>"), (path / 'node_modules').mkdir(), npm_error)[2])
+    if setup == 'active':
+        monkeypatch.setattr(plugins_cmd.sys.stdin, 'isatty', lambda: False)
+        plugins_cmd.cmd_install(source.as_uri(), enable=True, allow_removed=True)
+        flags = {**flags, 'force': True}
+    capsys.readouterr()
+    answer_no = {'fresh tty node no': 'node', 'fresh tty decline enable': 'enable'}.get(case)
+
+    def ask(kind, value):
+        print(f'<<{kind}?>>')
+        return value if kind != answer_no else 'n'
+    monkeypatch.setattr(plugins_cmd.sys.stdin, 'isatty', lambda: tty)
+    monkeypatch.setattr(plugins_cmd.sys.stdout, 'isatty', lambda: tty)
+    monkeypatch.setattr(plugins_cmd, '_ask_yes', lambda prompt: ask('enable', 'y') == 'y')
+    monkeypatch.setattr(plugins_cmd_install, 'line_input', lambda prompt: ask('env', 'value'))
+    monkeypatch.setattr('builtins.input', lambda prompt: ask('node' if 'node_modules' in prompt else 'other', 'y'))
+
+    plugins_cmd.cmd_install(source.as_uri(), allow_removed=True, **flags)
+
+    lines = re.sub(r'\x1b\[[0-9;]*m', '', capsys.readouterr().out).splitlines()
+    got = [m.group(1) if tag is None else tag for line in lines for key, tag in _TOKENS
+           if key in line for m in [re.search(r'<<(.*?)>>', line)] if tag is not None or m]
+    if npm_error is _NPM_OK:
+        expected = expected.replace(' warn', '')
+    assert ' '.join(got) == expected
+    assert (installed / 'node_modules').is_dir() is ('npm:' in expected)
+    enabled = yaml.safe_load((home / 'config.yaml').read_text(encoding='utf-8'))['plugins']['enabled']
+    assert ('node-plugin' in enabled) is (setup == 'active' or expected.endswith(' enabled'))
+
+
+def test_cli_install_without_package_json_runs_no_node_step(admission_env, monkeypatch):  # health: allow F811 -- pytest injects the imported admission_env fixture by parameter name
+    from pm import workspace
+
+    root, home = admission_env
+    source = root / 'plugin-source'
+    source.mkdir()
+    (source / 'plugin.yaml').write_text(yaml.safe_dump({'name': 'node-plugin'}), encoding='utf-8')
+    (source / '__init__.py').write_text('def register(ctx):\n    pass\n', encoding='utf-8')
     env = {k: v for k, v in os.environ.items() if k not in {'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'}}
     for args in [('init', '-q'), ('add', '.'), ('-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture')]:
         subprocess.run(['git', *args], cwd=source, env=env, check=True, capture_output=True, timeout=30)
     calls = []
-
-    def fake_npm(path, **_kwargs):
-        calls.append((path, (plugins_cmd._plugins_dir() / 'node-plugin').exists()))
-        (path / 'node_modules').mkdir()
-        (path / 'node_modules' / 'marker').write_text('ok', encoding='utf-8')
-        return npm_error
-
-    monkeypatch.setattr(workspace, 'install_node_sidecar', fake_npm)
+    monkeypatch.setattr(workspace, 'install_node_sidecar', lambda path, **_: calls.append(path))
     monkeypatch.setattr(plugins_cmd.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(plugins_cmd.sys.stdout, 'isatty', lambda: True)
     monkeypatch.setattr('builtins.input', lambda _prompt: 'y')
-    return source.as_uri(), calls
 
-
-_NODE_PLUGIN = {'plugin.yaml': yaml.safe_dump({'name': 'node-plugin'}), '__init__.py': 'def register(ctx):\n    pass\n'}
-
-
-_BUILD_ONLY_PACKAGE_JSON = json.dumps({'name': 'node-plugin', 'private': True, 'devDependencies': {'esbuild': '^0.20.0'}})
-
-
-@pytest.mark.parametrize('package_json, npm_error', [
-    (json.dumps({'name': 'node-plugin', 'version': '1.0.0'}), None),
-    (json.dumps({'name': 'node-plugin', 'version': '1.0.0'}), 'npm ci exited 1: boom'),
-    (_BUILD_ONLY_PACKAGE_JSON, 'npm install exited 1: no network'),
-], ids=['npm-ok', 'npm-fails', 'build-only-npm-fails'])
-def test_cli_install_runs_node_deps_in_the_staged_tree_before_publication(admission_env, monkeypatch, capsys, package_json, npm_error):  # health: allow F811 -- pytest injects the imported admission_env fixture by parameter name
-    """``hermes plugins install`` ran npm in the live plugin tree after publication. npm now runs in
-    the staged tree before publication, so its node_modules ship with the plugin. An npm failure
-    (e.g. a build-only package.json with prebuilt files committed) still only warns: the plugin is
-    published and enabled, as before."""
-    root, home = admission_env
-    uri, calls = _tty_install_recording_npm(root, monkeypatch, {**_NODE_PLUGIN, 'package.json': package_json}, npm_error)
-    installed = home / 'plugins' / 'node-plugin'
-
-    plugins_cmd.cmd_install(uri, enable=True, allow_removed=True)
-
-    assert len(calls) == 1
-    tree, live_tree_existed = calls[0]
-    assert tree != installed and not live_tree_existed, f'npm ran in {tree} after publication'
-    assert (installed / 'node_modules' / 'marker').read_text(encoding='utf-8') == 'ok'
-    assert 'node-plugin' in yaml.safe_load((home / 'config.yaml').read_text(encoding='utf-8'))['plugins']['enabled']
-    out = capsys.readouterr().out
-    assert ('Node deps: npm ' in out) is bool(npm_error), out
-
-
-def test_cli_install_without_package_json_runs_no_node_step(admission_env, monkeypatch):  # health: allow F811 -- pytest injects the imported admission_env fixture by parameter name
-    root, home = admission_env
-    uri, calls = _tty_install_recording_npm(root, monkeypatch, _NODE_PLUGIN)
-
-    plugins_cmd.cmd_install(uri, enable=True, allow_removed=True)
+    plugins_cmd.cmd_install(source.as_uri(), enable=True, allow_removed=True)
 
     assert calls == []
     assert (home / 'plugins' / 'node-plugin' / 'plugin.yaml').is_file()
@@ -247,32 +283,6 @@ def test_publish_assume_consent_skips_replacement_veto(tmp_path, monkeypatch):
 
     with pytest.raises(plugins_cmd.PluginOperationError, match='Reinstall declined'):
         plugins_transaction.publish_plugin(staged, target, {}, {'active-plugin': {}}, require_consent=True)
-
-
-@pytest.mark.parametrize('yes_deps', [False, True])
-def test_active_replacement_npm_failure_warns_and_publishes(tmp_path, monkeypatch, capsys, yes_deps):
-    """Replacing an active plugin runs npm once, in the staged tree before publication; an npm
-    failure warns and the replacement is still published, with and without --yes-deps."""
-    from hermes_cli import plugins_transaction
-    from pm import workspace as ws
-
-    staged, target = tmp_path / 'staged', tmp_path / 'target'
-    for tree in (staged, target):
-        tree.mkdir()
-        (tree / 'plugin.yaml').write_text(yaml.safe_dump({'name': 'active-plugin'}), encoding='utf-8')
-    (staged / 'package.json').write_text('{}', encoding='utf-8')
-    monkeypatch.setattr(ws, 'enabled_plugin_dirs', lambda **kwargs: [target])
-    events, prompts = [], []
-    monkeypatch.setattr('pm.client.sync_venv', lambda **kwargs: events.append('publish'))
-    monkeypatch.setattr(ws, 'install_node_sidecar', lambda path, **kwargs: events.append(path) or 'npm ci exited 1')
-    monkeypatch.setattr(plugins_cmd.sys.stdin, 'isatty', lambda: True)
-    monkeypatch.setattr(plugins_cmd.sys.stdout, 'isatty', lambda: True)
-    monkeypatch.setattr('builtins.input', lambda prompt: prompts.append(prompt) or 'y')
-
-    plugins_transaction.publish_plugin(staged, target, {}, {'active-plugin': {}}, require_consent=True,
-                                       assume_consent=yes_deps, node_deps=True)
-    assert (events, len(prompts)) == ([staged, 'publish'], 1)
-    assert 'Node deps: npm ci exited' in capsys.readouterr().out
 
 
 def test_install_parser_offers_yes_deps_exclusive_with_no_deps():
